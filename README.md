@@ -26,8 +26,8 @@ This tool connects to a Nexus Repository Manager instance, fetches all artifacts
 
 1.  Clone this repository:
     ```bash
-    git clone https://github.com/your-username/nexus-reposilite-syncer.git
-    cd nexus-reposilite-syncer
+    git clone https://github.com/okeren-cap/reposilite-mirror-export.git
+    
     ```
 2.  Install Python 3.x if you haven't already.
 3.  Install dependencies:
