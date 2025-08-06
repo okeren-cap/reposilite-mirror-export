@@ -221,14 +221,15 @@ class NexusToReposiliteSyncer:
             return False
 
     def get_all_asset_paths_from_nexus(self):
-        """Get all asset paths from Nexus using the Search Assets API."""
-        self.log(f"Fetching all asset paths from Nexus repository: {self.args.nexus_repository}")
+        """Get all asset paths from Nexus by listing components and their assets."""
+        self.log(f"Fetching all components from Nexus repository: {self.args.nexus_repository}")
         self.log(f"Nexus URL: {self.args.nexus_url}")
         self.log(f"Authentication: {self.args.nexus_username}:{'*' * len(self.args.nexus_password) if self.args.nexus_password else 'None'}")
 
         asset_paths = []
         continuation_token = None
         page = 1
+        component_count = 0
 
         while True:
             params = {
@@ -237,17 +238,17 @@ class NexusToReposiliteSyncer:
             if continuation_token:
                 params['continuationToken'] = continuation_token
 
-            url = f"{self.args.nexus_url}/service/rest/v1/search/assets"
+            url = f"{self.args.nexus_url}/service/rest/v1/components"
 
             try:
-                self.log(f"Fetching page {page} of assets...")
-                self.debug_log(f"Asset fetch URL: {url}")
-                self.debug_log(f"Asset fetch params: {params}")
+                self.log(f"Fetching page {page} of components...")
+                self.debug_log(f"Component fetch URL: {url}")
+                self.debug_log(f"Component fetch params: {params}")
 
                 response = self.nexus_session.get(url, params=params, timeout=self.args.timeout)
 
-                self.debug_log(f"Asset fetch response status: {response.status_code}")
-                self.debug_log(f"Asset fetch response headers: {dict(response.headers)}")
+                self.debug_log(f"Component fetch response status: {response.status_code}")
+                self.debug_log(f"Component fetch response headers: {dict(response.headers)}")
                 
                 if response.status_code != 200:
                     self.log(f"ERROR: HTTP {response.status_code} - {response.reason}", force=True)
@@ -257,18 +258,23 @@ class NexusToReposiliteSyncer:
                 data = response.json()
                 self.debug_log(f"Response JSON keys: {list(data.keys())}")
                 self.debug_log(f"Continuation token from response: {data.get('continuationToken')}")
-                page_items = data.get('items', [])
+                page_components = data.get('items', [])
                 
-                for asset in page_items:
-                    if asset.get('path'):
-                        asset_paths.append(asset['path'])
+                component_count += len(page_components)
+                assets_on_page = 0
+                
+                for component in page_components:
+                    for asset in component.get('assets', []):
+                        if asset.get('path'):
+                            asset_paths.append(asset['path'])
+                            assets_on_page += 1
 
-                self.log(f"Page {page}: Found {len(page_items)} assets (Total: {len(asset_paths)})")
+                self.log(f"Page {page}: Found {len(page_components)} components with {assets_on_page} assets (Total assets: {len(asset_paths)})")
 
-                if page_items:
-                    self.debug_log(f"Sample asset path from page: {page_items[0].get('path', 'N/A')}")
+                if page_components:
+                    self.debug_log(f"Sample component from page: {page_components[0].get('name', 'N/A')}")
                 else:
-                    self.debug_log("No assets found on this page.")
+                    self.debug_log("No components found on this page.")
 
                 continuation_token = data.get('continuationToken')
                 if not continuation_token:
@@ -278,20 +284,21 @@ class NexusToReposiliteSyncer:
                 time.sleep(0.2)
 
             except requests.exceptions.ConnectionError as e:
-                self.log("ERROR: Connection lost to Nexus server during asset fetch.", force=True)
+                self.log("ERROR: Connection lost to Nexus server during component fetch.", force=True)
                 self.log(f"Technical details: {e}", force=True)
                 break
             except requests.exceptions.Timeout:
-                self.log("ERROR: Request to Nexus for assets timed out.", force=True)
+                self.log("ERROR: Request to Nexus for components timed out.", force=True)
                 break
             except requests.RequestException as e:
-                self.log(f"ERROR: Failed to fetch assets from Nexus: {e}", force=True)
+                self.log(f"ERROR: Failed to fetch components from Nexus: {e}", force=True)
                 break
             except json.JSONDecodeError:
-                self.log(f"ERROR: Invalid JSON response from Nexus asset API.", force=True)
+                self.log(f"ERROR: Invalid JSON response from Nexus component API.", force=True)
                 self.log(f"Response content: {response.text[:500]}...", force=True)
                 break
 
+        self.log(f"Total components found: {component_count}")
         self.log(f"Total asset paths found in Nexus: {len(asset_paths)}")
         return asset_paths
     
