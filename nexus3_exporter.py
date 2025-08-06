@@ -54,6 +54,8 @@ Examples:
                        help='Custom log file path (default: auto-generated)')
     parser.add_argument('--list-repositories', action='store_true',
                        help='List available repositories and exit (no sync performed)')
+    parser.add_argument('--test-path',
+                       help='Test a single artifact path for debugging (no sync performed)')
     parser.add_argument('--debug', action='store_true',
                        help='Enable detailed debug logging for troubleshooting')
     parser.add_argument('--timeout', type=int, default=60,
@@ -65,6 +67,12 @@ Examples:
     if args.nexus_username and not args.nexus_password:
         args.nexus_password = os.getenv('NEXUS_PASSWORD')
         if not args.nexus_password:
+            # If a username is provided, a password is required.
+            # Fail early if not running interactively and no password is provided.
+            if not sys.stdout.isatty():
+                print("ERROR: Nexus username provided without a password in a non-interactive session.", file=sys.stderr)
+                print("Please provide --nexus-password or set NEXUS_PASSWORD environment variable.", file=sys.stderr)
+                sys.exit(1)
             import getpass
             args.nexus_password = getpass.getpass('Nexus password: ')
     
@@ -272,7 +280,7 @@ class NexusToReposiliteSyncer:
                 self.log(f"Page {page}: Found {len(page_components)} components with {assets_on_page} assets (Total assets: {len(asset_paths)})")
 
                 if page_components:
-                    self.debug_log(f"Sample component from page: {page_components[0].get('name', 'N/A')}")
+                    self.debug_log(f"Sample component from page: {json.dumps(page_components[0], indent=2)}")
                 else:
                     self.debug_log("No components found on this page.")
 
@@ -418,8 +426,68 @@ class NexusToReposiliteSyncer:
         self.log(f"Log file: {self.log_file}", force=True)
         self.log("=" * 80, force=True)
 
+    def test_single_path(self, path):
+        """Test a single path against Reposilite with detailed debug output"""
+        self.log("--- STARTING SINGLE PATH TEST ---", force=True)
+        self.log(f"Testing path: {path}", force=True)
+        
+        url = f"{self.args.reposilite_url}/{self.args.reposilite_repository}/{path}"
+        self.log(f"Request URL: {url}", force=True)
+        
+        self.log("\n--- Request ---", force=True)
+        self.log("Method: GET (to retrieve error details if any)", force=True)
+
+        try:
+            # Use GET with stream=True to get headers and potentially body without downloading a large file
+            response = self.reposilite_session.get(url, timeout=self.args.timeout, stream=True)
+            
+            self.log("\n--- Response ---", force=True)
+            self.log(f"Status Code: {response.status_code} {response.reason}", force=True)
+            
+            self.log("\n--- Response Headers ---", force=True)
+            for header, value in response.headers.items():
+                self.log(f"  {header}: {value}", force=True)
+
+            if response.status_code == 200:
+                self.log("\n--- Result ---", force=True)
+                self.log("✓ SUCCESS: Artifact is available in Reposilite.", force=True)
+                self.log(f"Content-Length: {response.headers.get('Content-Length', 'N/A')}", force=True)
+            else:
+                self.log("\n--- Response Body (first 500 bytes) ---", force=True)
+                body = response.raw.read(500)
+                try:
+                    self.log(body.decode('utf-8'), force=True)
+                except UnicodeDecodeError:
+                    self.log(str(body), force=True)
+
+                self.log("\n--- Result ---", force=True)
+                self.log("✗ FAILED: Artifact not available or an error occurred.", force=True)
+                self.log("\n--- TROUBLESHOOTING SUGGESTIONS ---", force=True)
+                self.log("1. Check Reposilite server logs for errors related to the request.", force=True)
+                self.log(f"   (Look for requests to {self.args.reposilite_repository}/{path})", force=True)
+                self.log("2. Verify that the Reposilite server can connect to the Nexus server:", force=True)
+                self.log(f"   - Nexus URL configured in Reposilite should be reachable from Reposilite's host.", force=True)
+                self.log("3. If Nexus requires authentication, ensure credentials are correctly configured in Reposilite's settings for the remote repository.", force=True)
+                self.log("4. The artifact might truly be missing from the mirrored Nexus repo, despite being listed.", force=True)
+
+        except requests.exceptions.Timeout:
+            self.log("\n--- Result ---", force=True)
+            self.log("✗ FAILED: Request to Reposilite timed out.", force=True)
+        except requests.exceptions.RequestException as e:
+            self.log("\n--- Result ---", force=True)
+            self.log(f"✗ FAILED: A request error occurred: {e}", force=True)
+
+        self.log("\n--- END OF SINGLE PATH TEST ---", force=True)
+
 def main():
     args = parse_arguments()
+    syncer = NexusToReposiliteSyncer(args)
+
+    # Handle single path test mode
+    if args.test_path:
+        print("--- Single Path Test Mode ---")
+        syncer.test_single_path(args.test_path)
+        sys.exit(0)
     
     # Handle repository listing mode
     if args.list_repositories:
@@ -431,7 +499,6 @@ def main():
         print()
         
         # Create syncer just for repository listing
-        syncer = NexusToReposiliteSyncer(args)
         success = syncer.list_nexus_repositories()
         
         if success:
@@ -468,7 +535,6 @@ def main():
             sys.exit(0)
     
     # Start synchronization
-    syncer = NexusToReposiliteSyncer(args)
     try:
         success = syncer.sync_all_artifacts()
         sys.exit(0 if success else 1)
