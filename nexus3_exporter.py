@@ -18,9 +18,9 @@ Examples:
   %(prog)s --nexus-repository maven-releases        # Override just the repository
   %(prog)s --reposilite-url http://other:8080       # Override reposilite URL
   %(prog)s --rate-limit 10 --yes --quiet            # Custom rate limit, automated mode
-  %(prog)s --nexus-url https://nexus.example.com \\
-           --nexus-repository core-releases \\
-           --reposilite-url http://localhost:8080 \\
+  %(prog)s --nexus-url https://nexus.example.com \
+           --nexus-repository core-releases \
+           --reposilite-url http://localhost:8080 \
            --reposilite-repository releases          # Full custom configuration
         '''
     )
@@ -58,6 +58,12 @@ Examples:
                        help='Enable detailed debug logging for troubleshooting')
     parser.add_argument('--timeout', type=int, default=60,
                         help='Request timeout in seconds for Nexus API calls (default: 60)')
+    parser.add_argument('--list-gavs', action='store_true',
+                        help='List all unique GAVs (groupId:artifactId:version) in the specified repository and exit')
+    parser.add_argument('--gavs-output',
+                        help='Optional file to write GAVs. If ends with .json, a JSON array of objects will be written; otherwise one GAV per line')
+    parser.add_argument('--sync-by-gav', action='store_true',
+                        help='Sync all assets by first discovering GAVs and then fetching all files for each GAV.')
     
     args = parser.parse_args()
     
@@ -295,6 +301,102 @@ class NexusToReposiliteSyncer:
         self.log(f"Total asset paths found in Nexus: {len(asset_paths)}")
         return asset_paths
     
+    def get_all_gavs_from_nexus(self):
+        """Fetch every asset via the Assets Search API and collect unique GAVs (groupId, artifactId, version)."""
+        self.log(f"Fetching all unique GAVs from Nexus repository: {self.args.nexus_repository}")
+        self.log(f"Nexus URL: {self.args.nexus_url}")
+        self.log(f"Authentication: {self.args.nexus_username}:{'*' * len(self.args.nexus_password) if self.args.nexus_password else 'None'}")
+
+        unique_gavs = set()
+        continuation_token = None
+        page = 1
+
+        while True:
+            params = {
+                'repository': self.args.nexus_repository
+            }
+            if continuation_token:
+                params['continuationToken'] = continuation_token
+
+            url = f"{self.args.nexus_url}/service/rest/v1/search/assets"
+
+            try:
+                self.log(f"Fetching page {page} of assets...")
+                self.debug_log(f"Asset fetch URL: {url}")
+                self.debug_log(f"Asset fetch params: {params}")
+
+                response = self.nexus_session.get(url, params=params, timeout=self.args.timeout)
+
+                self.debug_log(f"Asset fetch response status: {response.status_code}")
+                self.debug_log(f"Asset fetch response headers: {dict(response.headers)}")
+
+                if response.status_code != 200:
+                    self.log(f"ERROR: HTTP {response.status_code} - {response.reason}", force=True)
+                    self.log(f"Response content: {response.text[:500]}...", force=True)
+                    break
+
+                data = response.json()
+                page_items = data.get('items', [])
+
+                for asset in page_items:
+                    if str(asset.get('format', '')).lower() != 'maven2':
+                        continue
+
+                    m2 = asset.get('maven2') or {}
+                    group_id = m2.get('groupId')
+                    artifact_id = m2.get('artifactId')
+                    version = m2.get('version')
+
+                    if group_id and artifact_id and version:
+                        unique_gavs.add((group_id, artifact_id, version))
+                        continue
+
+                    # Fallback to parsing path for safety
+                    path = asset.get('path') or ''
+                    if not path:
+                        continue
+                    # Ignore metadata/checksum helper files
+                    filename = path.split('/')[-1]
+                    if filename.endswith('maven-metadata.xml') or filename.endswith('.sha1') or filename.endswith('.md5'):
+                        continue
+
+                    segments = path.split('/')
+                    # Expect .../<groupId as path>/<artifactId>/<version>/<file>
+                    if len(segments) >= 4:
+                        parsed_version = segments[-2]
+                        parsed_artifact_id = segments[-3]
+                        group_parts = segments[:-3]
+                        parsed_group_id = '.'.join(group_parts) if group_parts else None
+                        if parsed_group_id and parsed_artifact_id and parsed_version:
+                            unique_gavs.add((parsed_group_id, parsed_artifact_id, parsed_version))
+
+                self.log(f"Page {page}: Processed {len(page_items)} assets (Unique GAVs so far: {len(unique_gavs)})")
+
+                continuation_token = data.get('continuationToken')
+                if not continuation_token:
+                    break
+
+                page += 1
+                time.sleep(0.2)
+
+            except requests.exceptions.ConnectionError as e:
+                self.log("ERROR: Connection lost to Nexus server during assets scan.", force=True)
+                self.log(f"Technical details: {e}", force=True)
+                break
+            except requests.exceptions.Timeout:
+                self.log("ERROR: Request to Nexus for assets timed out.", force=True)
+                break
+            except requests.RequestException as e:
+                self.log(f"ERROR: Failed to fetch assets from Nexus: {e}", force=True)
+                break
+            except json.JSONDecodeError:
+                self.log(f"ERROR: Invalid JSON response from Nexus asset API.", force=True)
+                self.log(f"Response content: {response.text[:500]}...", force=True)
+                break
+
+        self.log(f"Total unique GAVs found: {len(unique_gavs)}")
+        return unique_gavs
+    
     def request_artifact_in_reposilite(self, path):
         """Request artifact in Reposilite to trigger caching"""
         url = f"{self.args.reposilite_url}/{self.args.reposilite_repository}/{path}"
@@ -321,33 +423,11 @@ class NexusToReposiliteSyncer:
         except requests.RequestException as e:
             return False, f"Request error: {str(e)}"
     
-    def sync_all_artifacts(self):
-        """Main synchronization process"""
-        self.log("=" * 80, force=True)
-        self.log("NEXUS TO REPOSILITE FULL EXPORT STARTED", force=True)
-        self.log("=" * 80, force=True)
-        self.log(f"Source: {self.args.nexus_url}/repository/{self.args.nexus_repository}", force=True)
-        self.log(f"Target: {self.args.reposilite_url}/{self.args.reposilite_repository}", force=True)
-        self.log(f"Log file: {self.log_file}", force=True)
-        
-        # Step 0: Test connectivity first
-        if not self.test_nexus_connectivity():
-            self.log("ERROR: Cannot establish connection to Nexus - aborting sync", force=True)
-            return False
-        
-        # Step 1: Get all asset paths from Nexus
-        asset_paths = self.get_all_asset_paths_from_nexus()
-        self.debug_log(f"Total asset paths retrieved from Nexus: {len(asset_paths)}")
-        
-        if not asset_paths:
-            self.log("ERROR: No asset paths found or failed to fetch from Nexus", force=True)
-            self.log("TROUBLESHOOTING:", force=True)
-            self.log("1. Check if the repository name is correct with --list-repositories", force=True)
-            self.log("2. Verify read permissions for the user on the repository.", force=True)
-            self.log("3. The repository might actually be empty.", force=True)
-            return False
-        
-        # Step 2: Process each artifact path
+    def _process_asset_paths(self, asset_paths):
+        """
+        Iterate through a list of asset paths, request each from Reposilite,
+        and track statistics.
+        """
         self.log("\n" + "=" * 80, force=True)
         self.log("STARTING ARTIFACT SYNCHRONIZATION", force=True)
         self.log("=" * 80, force=True)
@@ -378,11 +458,122 @@ class NexusToReposiliteSyncer:
                 if elapsed.total_seconds() > 0:
                     rate = self.total_artifacts / elapsed.total_seconds()
                     self.log(f"  Progress: {self.total_artifacts} artifacts processed, {rate:.2f} artifacts/sec")
+
+    def sync_all_artifacts(self):
+        """Main synchronization process"""
+        self.log("=" * 80, force=True)
+        self.log("NEXUS TO REPOSILITE FULL EXPORT STARTED", force=True)
+        self.log("=" * 80, force=True)
+        self.log(f"Source: {self.args.nexus_url}/repository/{self.args.nexus_repository}", force=True)
+        self.log(f"Target: {self.args.reposilite_url}/{self.args.reposilite_repository}", force=True)
+        self.log(f"Log file: {self.log_file}", force=True)
+        
+        # Step 0: Test connectivity first
+        if not self.test_nexus_connectivity():
+            self.log("ERROR: Cannot establish connection to Nexus - aborting sync", force=True)
+            return False
+        
+        # Step 1: Get all asset paths from Nexus
+        asset_paths = self.get_all_asset_paths_from_nexus()
+        self.debug_log(f"Total asset paths retrieved from Nexus: {len(asset_paths)}")
+        
+        if not asset_paths:
+            self.log("ERROR: No asset paths found or failed to fetch from Nexus", force=True)
+            self.log("TROUBLESHOOTING:", force=True)
+            self.log("1. Check if the repository name is correct with --list-repositories", force=True)
+            self.log("2. Verify read permissions for the user on the repository.", force=True)
+            self.log("3. The repository might actually be empty.", force=True)
+            return False
+        
+        # Step 2: Process each artifact path
+        self._process_asset_paths(asset_paths)
         
         # Final summary
         self.print_summary()
         return True
     
+    def get_all_asset_paths_for_gavs(self, gavs):
+        """
+        For a given list of GAVs, search Nexus for all associated asset paths.
+        """
+        self.log(f"Fetching all asset paths for {len(gavs)} GAVs...")
+        all_asset_paths = set()
+        
+        for i, (group_id, artifact_id, version) in enumerate(gavs, 1):
+            self.log(f"[{i}/{len(gavs)}] Searching assets for GAV: {group_id}:{artifact_id}:{version}")
+            continuation_token = None
+            
+            while True:
+                params = {
+                    'repository': self.args.nexus_repository,
+                    'maven.groupId': group_id,
+                    'maven.artifactId': artifact_id,
+                    'maven.version': version,
+                }
+                if continuation_token:
+                    params['continuationToken'] = continuation_token
+
+                url = f"{self.args.nexus_url}/service/rest/v1/search"
+                
+                try:
+                    response = self.nexus_session.get(url, params=params, timeout=self.args.timeout)
+
+                    if response.status_code != 200:
+                        self.log(f"  ERROR: HTTP {response.status_code} fetching assets for GAV. Skipping.")
+                        break
+
+                    data = response.json()
+                    for item in data.get('items', []):
+                        for asset in item.get('assets', []):
+                            if asset.get('path'):
+                                all_asset_paths.add(asset['path'])
+                    
+                    continuation_token = data.get('continuationToken')
+                    if not continuation_token:
+                        break
+                        
+                except Exception as e:
+                    self.log(f"  ERROR fetching assets for GAV: {e}")
+                    break
+            
+            time.sleep(0.1) # Small delay to avoid overwhelming Nexus
+            
+        self.log(f"Found {len(all_asset_paths)} unique asset paths for all GAVs.")
+        return list(all_asset_paths)
+
+    def sync_by_gav(self):
+        """
+        Orchestrates the sync process by first discovering all GAVs,
+        then fetching all their assets, and finally processing them.
+        """
+        self.log("=" * 80, force=True)
+        self.log("NEXUS TO REPOSILITE FULL EXPORT (GAV-BASED) STARTED", force=True)
+        self.log("=" * 80, force=True)
+        
+        # Step 0: Test connectivity
+        if not self.test_nexus_connectivity():
+            return False
+
+        # Step 1: Discover all unique GAVs
+        gavs = self.get_all_gavs_from_nexus()
+        if not gavs:
+            self.log("ERROR: No GAVs found or failed to fetch from Nexus", force=True)
+            self.log("Ensure the repository is not empty and has read permissions.", force=True)
+            return False
+
+        # Step 2: Get all asset paths for all GAVs
+        asset_paths = self.get_all_asset_paths_for_gavs(gavs)
+        if not asset_paths:
+            self.log("ERROR: No asset paths found for the discovered GAVs.", force=True)
+            return False
+            
+        # Step 3: Process all asset paths
+        self._process_asset_paths(asset_paths)
+        
+        # Step 4: Final summary
+        self.print_summary()
+        return True
+
     def print_summary(self):
         """Print final synchronization summary"""
         elapsed = datetime.now() - self.start_time
@@ -433,6 +624,49 @@ def main():
         
         sys.exit(0 if success else 1)
     
+    if args.list_gavs:
+        print("Nexus GAV Discovery Tool")
+        print("=" * 50)
+        print(f"Source: {args.nexus_url}/repository/{args.nexus_repository}")
+        if args.nexus_username:
+            print(f"Nexus authentication: {args.nexus_username}")
+        print()
+
+        syncer = NexusToReposiliteSyncer(args)
+        if not syncer.test_nexus_connectivity():
+            sys.exit(1)
+
+        gavs = syncer.get_all_gavs_from_nexus()
+        print(f"Total unique GAVs: {len(gavs)}")
+
+        # Output handling
+        if args.gavs_output:
+            output_path = args.gavs_output
+            try:
+                if output_path.lower().endswith('.json'):
+                    # Write JSON array of objects
+                    gav_list = [
+                        {"groupId": g, "artifactId": a, "version": v}
+                        for (g, a, v) in sorted(gavs)
+                    ]
+                    with open(output_path, 'w', encoding='utf-8') as f:
+                        json.dump(gav_list, f, indent=2)
+                else:
+                    # Write one GAV per line
+                    with open(output_path, 'w', encoding='utf-8') as f:
+                        for g, a, v in sorted(gavs):
+                            f.write(f"{g}:{a}:{v}\n")
+                print(f"Wrote GAVs to: {output_path}")
+                sys.exit(0)
+            except Exception as e:
+                print(f"ERROR: Failed to write GAVs to file: {e}")
+                sys.exit(1)
+        else:
+            # Print all to stdout
+            for g, a, v in sorted(gavs):
+                print(f"{g}:{a}:{v}")
+            sys.exit(0)
+    
     print("Nexus to Reposilite Full Export Tool")
     print("=" * 50)
     
@@ -463,7 +697,10 @@ def main():
     # Start synchronization
     syncer = NexusToReposiliteSyncer(args)
     try:
-        success = syncer.sync_all_artifacts()
+        if args.sync_by_gav:
+            success = syncer.sync_by_gav()
+        else:
+            success = syncer.sync_all_artifacts()
         sys.exit(0 if success else 1)
     except KeyboardInterrupt:
         syncer.log("\nERROR: Export interrupted by user", force=True)
