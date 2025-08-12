@@ -65,6 +65,11 @@ Examples:
     parser.add_argument('--sync-by-gav', action='store_true',
                         help='Sync all assets by first discovering GAVs and then fetching all files for each GAV.')
     
+    parser.add_argument('--generate-tree-view', action='store_true',
+                        help='Generates a file tree view of all artifacts in the repository and exits.')
+    parser.add_argument('--tree-output-file',
+                        help='Optional file to write the tree view to. If not provided, prints to console.')
+    
     args = parser.parse_args()
     
     # Handle password from environment variable if not provided
@@ -506,9 +511,9 @@ class NexusToReposiliteSyncer:
             while True:
                 params = {
                     'repository': self.args.nexus_repository,
-                    'maven.groupId': group_id,
-                    'maven.artifactId': artifact_id,
-                    'maven.version': version,
+                    'group': group_id,
+                    'name': artifact_id,
+                    'version': version,
                 }
                 if continuation_token:
                     params['continuationToken'] = continuation_token
@@ -520,6 +525,7 @@ class NexusToReposiliteSyncer:
 
                     if response.status_code != 200:
                         self.log(f"  ERROR: HTTP {response.status_code} fetching assets for GAV. Skipping.")
+                        self.debug_log(f"  Response content: {response.text[:500]}...")
                         break
 
                     data = response.json()
@@ -602,6 +608,59 @@ class NexusToReposiliteSyncer:
         self.log(f"Log file: {self.log_file}", force=True)
         self.log("=" * 80, force=True)
 
+    def generate_tree_view(self, output_file=None):
+        """Generates a file tree view of all artifacts in the repository."""
+        self.log("Generating artifact tree view...", force=True)
+        if not self.test_nexus_connectivity():
+            self.log("ERROR: Cannot connect to Nexus.", force=True)
+            return False
+
+        asset_paths = self.get_all_asset_paths_from_nexus()
+        if not asset_paths:
+            self.log("No assets found to build the tree.", force=True)
+            return False
+
+        self.log(f"Building tree from {len(asset_paths)} asset paths...", force=True)
+        tree = self._build_tree_from_paths(asset_paths)
+        
+        self.log("Printing tree...", force=True)
+        
+        output_handle = open(output_file, 'w', encoding='utf-8') if output_file else sys.stdout
+        try:
+            self._print_tree(tree, output_handle=output_handle)
+        finally:
+            if output_file and output_handle is not sys.stdout:
+                output_handle.close()
+        
+        if output_file:
+            self.log(f"Tree view written to {output_file}", force=True)
+        
+        return True
+
+    def _build_tree_from_paths(self, paths):
+        """Build a hierarchical dictionary from a list of file paths."""
+        tree = {}
+        for path in sorted(paths):
+            parts = path.split('/')
+            d = tree
+            for part in parts[:-1]:
+                d = d.setdefault(part, {})
+            d[parts[-1]] = None  # Mark as a file
+        return tree
+
+    def _print_tree(self, tree, prefix="", output_handle=sys.stdout):
+        """Recursively prints a tree structure to the given output handle."""
+        items = sorted(list(tree.keys()))
+        for i, name in enumerate(items):
+            is_last = i == len(items) - 1
+            connector = "└── " if is_last else "├── "
+            
+            output_handle.write(f"{prefix}{connector}{name}\n")
+            
+            if isinstance(tree[name], dict):  # It's a directory
+                new_prefix = prefix + ("    " if is_last else "│   ")
+                self._print_tree(tree[name], prefix=new_prefix, output_handle=output_handle)
+
 def main():
     args = parse_arguments()
     
@@ -666,6 +725,18 @@ def main():
             for g, a, v in sorted(gavs):
                 print(f"{g}:{a}:{v}")
             sys.exit(0)
+    
+    if args.generate_tree_view:
+        print("Nexus Artifact Tree View Generator")
+        print("=" * 50)
+        print(f"Source: {args.nexus_url}/repository/{args.nexus_repository}")
+        if args.nexus_username:
+            print(f"Nexus authentication: {args.nexus_username}")
+        print()
+
+        syncer = NexusToReposiliteSyncer(args)
+        success = syncer.generate_tree_view(output_file=args.tree_output_file)
+        sys.exit(0 if success else 1)
     
     print("Nexus to Reposilite Full Export Tool")
     print("=" * 50)
