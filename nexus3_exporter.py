@@ -10,18 +10,23 @@ from datetime import datetime
 def parse_arguments():
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(
-        description='Nexus to Reposilite Full Export Tool - Synchronize artifacts from Nexus to Reposilite',
+        description='Nexus to Reposilite Full Export Tool - Synchronize artifacts from Nexus to Reposilite with enhanced completeness',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''
 Examples:
-  %(prog)s                                           # Use all defaults
+  %(prog)s                                           # Use all defaults with both APIs for max completeness
   %(prog)s --nexus-repository maven-releases        # Override just the repository
   %(prog)s --reposilite-url http://other:8080       # Override reposilite URL
   %(prog)s --rate-limit 10 --yes --quiet            # Custom rate limit, automated mode
+  %(prog)s --validate-after-sync                    # Sync and then validate completeness
+  %(prog)s --validate-only                          # Only validate existing sync without re-syncing
+  %(prog)s --use-assets-api-only                    # Use original Assets API only (legacy mode)
+  %(prog)s --use-components-api-only                # Use Components API only (alternative method)
   %(prog)s --nexus-url https://nexus.example.com \
            --nexus-repository core-releases \
            --reposilite-url http://localhost:8080 \
-           --reposilite-repository releases          # Full custom configuration
+           --reposilite-repository releases \
+           --validate-after-sync                     # Full custom configuration with validation
         '''
     )
     
@@ -69,6 +74,17 @@ Examples:
                         help='Generates a file tree view of all artifacts in the repository and exits.')
     parser.add_argument('--tree-output-file',
                         help='Optional file to write the tree view to. If not provided, prints to console.')
+    
+    parser.add_argument('--use-assets-api-only', action='store_true',
+                        help='Use only the Assets API for fetching artifacts (legacy behavior)')
+    parser.add_argument('--use-components-api-only', action='store_true',
+                        help='Use only the Components API for fetching artifacts')
+    # If neither flag is specified, both APIs will be used for maximum completeness
+    
+    parser.add_argument('--validate-after-sync', action='store_true',
+                        help='Validate that all assets are available in Reposilite after sync completes')
+    parser.add_argument('--validate-only', action='store_true',
+                        help='Skip sync and only validate existing assets in Reposilite against Nexus')
     
     args = parser.parse_args()
     
@@ -306,6 +322,73 @@ class NexusToReposiliteSyncer:
         self.log(f"Total asset paths found in Nexus: {len(asset_paths)}")
         return asset_paths
     
+    def get_all_asset_paths_from_components_api(self):
+        """Get all asset paths from Nexus using the Components API as an alternative method."""
+        self.log(f"Fetching all asset paths from Nexus Components API for repository: {self.args.nexus_repository}")
+
+        asset_paths = []
+        continuation_token = None
+        page = 1
+
+        while True:
+            params = {
+                'repository': self.args.nexus_repository
+            }
+            if continuation_token:
+                params['continuationToken'] = continuation_token
+
+            url = f"{self.args.nexus_url}/service/rest/v1/components"
+
+            try:
+                self.log(f"Fetching page {page} of components...")
+                self.debug_log(f"Components fetch URL: {url}")
+                self.debug_log(f"Components fetch params: {params}")
+
+                response = self.nexus_session.get(url, params=params, timeout=self.args.timeout)
+
+                self.debug_log(f"Components fetch response status: {response.status_code}")
+                
+                if response.status_code != 200:
+                    self.log(f"ERROR: HTTP {response.status_code} - {response.reason}", force=True)
+                    self.log(f"Response content: {response.text[:500]}...", force=True)
+                    break
+
+                data = response.json()
+                page_items = data.get('items', [])
+                
+                for component in page_items:
+                    # Each component has multiple assets
+                    for asset in component.get('assets', []):
+                        if asset.get('path'):
+                            asset_paths.append(asset['path'])
+
+                self.log(f"Page {page}: Found {len(page_items)} components with {len([a for c in page_items for a in c.get('assets', [])])} assets (Total asset paths: {len(asset_paths)})")
+
+                continuation_token = data.get('continuationToken')
+                if not continuation_token:
+                    break
+                
+                page += 1
+                time.sleep(0.2)
+
+            except requests.exceptions.ConnectionError as e:
+                self.log("ERROR: Connection lost to Nexus server during components fetch.", force=True)
+                self.log(f"Technical details: {e}", force=True)
+                break
+            except requests.exceptions.Timeout:
+                self.log("ERROR: Request to Nexus for components timed out.", force=True)
+                break
+            except requests.RequestException as e:
+                self.log(f"ERROR: Failed to fetch components from Nexus: {e}", force=True)
+                break
+            except json.JSONDecodeError:
+                self.log(f"ERROR: Invalid JSON response from Nexus components API.", force=True)
+                self.log(f"Response content: {response.text[:500]}...", force=True)
+                break
+
+        self.log(f"Total asset paths found via Components API: {len(asset_paths)}")
+        return asset_paths
+    
     def get_all_gavs_from_nexus(self):
         """Fetch every asset via the Assets Search API and collect unique GAVs (groupId, artifactId, version)."""
         self.log(f"Fetching all unique GAVs from Nexus repository: {self.args.nexus_repository}")
@@ -360,10 +443,7 @@ class NexusToReposiliteSyncer:
                     path = asset.get('path') or ''
                     if not path:
                         continue
-                    # Ignore metadata/checksum helper files
-                    filename = path.split('/')[-1]
-                    if filename.endswith('maven-metadata.xml') or filename.endswith('.sha1') or filename.endswith('.md5'):
-                        continue
+                    # Include all files including metadata and checksums as they are essential for Maven repositories
 
                     segments = path.split('/')
                     # Expect .../<groupId as path>/<artifactId>/<version>/<file>
@@ -428,6 +508,45 @@ class NexusToReposiliteSyncer:
         except requests.RequestException as e:
             return False, f"Request error: {str(e)}"
     
+    def validate_sync_completeness(self, asset_paths):
+        """Validate that all assets from Nexus are available in Reposilite"""
+        self.log("Validating sync completeness...", force=True)
+        
+        missing_files = []
+        validation_errors = []
+        
+        for i, path in enumerate(asset_paths, 1):
+            if i % 100 == 0:  # Progress update every 100 files
+                self.log(f"Validation progress: {i}/{len(asset_paths)} ({i/len(asset_paths)*100:.1f}%)")
+                
+            url = f"{self.args.reposilite_url}/{self.args.reposilite_repository}/{path}"
+            
+            try:
+                response = self.reposilite_session.head(url, timeout=10)
+                if response.status_code == 404:
+                    missing_files.append(path)
+                elif response.status_code not in [200, 304]:
+                    validation_errors.append((path, f"HTTP {response.status_code}"))
+                    
+            except Exception as e:
+                validation_errors.append((path, str(e)))
+                
+            time.sleep(0.05)  # Small delay to avoid overwhelming the server
+        
+        self.log(f"Validation complete:", force=True)
+        self.log(f"  Total files checked: {len(asset_paths)}", force=True)
+        self.log(f"  Missing files: {len(missing_files)}", force=True)
+        self.log(f"  Validation errors: {len(validation_errors)}", force=True)
+        
+        if missing_files:
+            self.log("MISSING FILES (first 20):", force=True)
+            for path in missing_files[:20]:
+                self.log(f"  - {path}", force=True)
+            if len(missing_files) > 20:
+                self.log(f"  ... and {len(missing_files) - 20} more missing files", force=True)
+                
+        return len(missing_files) == 0, missing_files, validation_errors
+    
     def _process_asset_paths(self, asset_paths):
         """
         Iterate through a list of asset paths, request each from Reposilite,
@@ -478,9 +597,42 @@ class NexusToReposiliteSyncer:
             self.log("ERROR: Cannot establish connection to Nexus - aborting sync", force=True)
             return False
         
-        # Step 1: Get all asset paths from Nexus
-        asset_paths = self.get_all_asset_paths_from_nexus()
-        self.debug_log(f"Total asset paths retrieved from Nexus: {len(asset_paths)}")
+        # Step 1: Get all asset paths from Nexus using appropriate API method(s)
+        if self.args.use_assets_api_only:
+            self.log("Using Assets API only (as requested)...")
+            asset_paths = self.get_all_asset_paths_from_nexus()
+            self.log(f"Assets API found: {len(asset_paths)} asset paths")
+        elif self.args.use_components_api_only:
+            self.log("Using Components API only (as requested)...")
+            asset_paths = self.get_all_asset_paths_from_components_api()
+            self.log(f"Components API found: {len(asset_paths)} asset paths")
+        else:
+            # Default: Use both APIs for maximum completeness
+            self.log("Fetching assets using multiple API methods to ensure completeness...")
+            
+            # Method 1: Assets API
+            asset_paths_from_assets = self.get_all_asset_paths_from_nexus()
+            self.log(f"Assets API found: {len(asset_paths_from_assets)} asset paths")
+            
+            # Method 2: Components API
+            asset_paths_from_components = self.get_all_asset_paths_from_components_api()
+            self.log(f"Components API found: {len(asset_paths_from_components)} asset paths")
+            
+            # Combine and deduplicate
+            asset_paths = list(set(asset_paths_from_assets + asset_paths_from_components))
+            self.log(f"Combined unique asset paths: {len(asset_paths)}")
+            
+            # Report on differences
+            assets_only = set(asset_paths_from_assets) - set(asset_paths_from_components)
+            components_only = set(asset_paths_from_components) - set(asset_paths_from_assets)
+            
+            if assets_only:
+                self.log(f"Assets API found {len(assets_only)} additional paths not in Components API")
+                self.debug_log(f"Sample assets-only paths: {list(assets_only)[:5]}")
+            
+            if components_only:
+                self.log(f"Components API found {len(components_only)} additional paths not in Assets API")
+                self.debug_log(f"Sample components-only paths: {list(components_only)[:5]}")
         
         if not asset_paths:
             self.log("ERROR: No asset paths found or failed to fetch from Nexus", force=True)
@@ -490,8 +642,34 @@ class NexusToReposiliteSyncer:
             self.log("3. The repository might actually be empty.", force=True)
             return False
         
-        # Step 2: Process each artifact path
-        self._process_asset_paths(asset_paths)
+        # Step 2: Process each artifact path (unless validation-only mode)
+        if not self.args.validate_only:
+            self._process_asset_paths(asset_paths)
+        else:
+            self.log("Skipping sync - validation-only mode requested", force=True)
+        
+        # Step 3: Validate sync completeness if requested
+        if self.args.validate_after_sync or self.args.validate_only:
+            self.log("\n" + "=" * 80, force=True)
+            self.log("STARTING VALIDATION", force=True)
+            self.log("=" * 80, force=True)
+            
+            is_complete, missing_files, validation_errors = self.validate_sync_completeness(asset_paths)
+            
+            if is_complete:
+                self.log("✓ VALIDATION PASSED: All assets are available in Reposilite!", force=True)
+            else:
+                self.log(f"✗ VALIDATION FAILED: {len(missing_files)} assets are missing in Reposilite", force=True)
+                
+                # Save missing files to log for later analysis
+                with open(self.log_file + ".missing", 'w', encoding='utf-8') as f:
+                    f.write("# Missing files found during validation\n")
+                    f.write(f"# Total missing: {len(missing_files)}\n")
+                    f.write("# One file path per line\n\n")
+                    for missing_file in missing_files:
+                        f.write(f"{missing_file}\n")
+                
+                self.log(f"Missing files list saved to: {self.log_file}.missing", force=True)
         
         # Final summary
         self.print_summary()
@@ -737,6 +915,16 @@ def main():
         syncer = NexusToReposiliteSyncer(args)
         success = syncer.generate_tree_view(output_file=args.tree_output_file)
         sys.exit(0 if success else 1)
+    
+    if args.validate_only:
+        print("Nexus to Reposilite Validation Tool")
+        print("=" * 50)
+        print(f"Source: {args.nexus_url}/repository/{args.nexus_repository}")
+        print(f"Target: {args.reposilite_url}/{args.reposilite_repository}")
+        if args.nexus_username:
+            print(f"Nexus authentication: {args.nexus_username}")
+        print("\n🔍 VALIDATION MODE: Will check completeness without syncing")
+        print()
     
     print("Nexus to Reposilite Full Export Tool")
     print("=" * 50)
