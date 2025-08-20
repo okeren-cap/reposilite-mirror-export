@@ -6,27 +6,41 @@ import sys
 import argparse
 import os
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
 def parse_arguments():
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(
-        description='Nexus to Reposilite Full Export Tool - Synchronize artifacts from Nexus to Reposilite with enhanced completeness',
+        description='Nexus Export Tool - Synchronize artifacts from Nexus to Reposilite or export directly to filesystem',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''
 Examples:
+  # Reposilite Caching (Original Functionality):
   %(prog)s                                           # Use all defaults with both APIs for max completeness
   %(prog)s --nexus-repository maven-releases        # Override just the repository
   %(prog)s --reposilite-url http://other:8080       # Override reposilite URL
   %(prog)s --rate-limit 10 --yes --quiet            # Custom rate limit, automated mode
   %(prog)s --validate-after-sync                    # Sync and then validate completeness
   %(prog)s --validate-only                          # Only validate existing sync without re-syncing
-  %(prog)s --use-assets-api-only                    # Use original Assets API only (legacy mode)
-  %(prog)s --use-components-api-only                # Use Components API only (alternative method)
+
+  # Filesystem Export (NEW Feature using downloadUrls):
+  %(prog)s --export-to-path /tmp/maven-export       # Export to filesystem only
+  %(prog)s --export-to-path ./artifacts \
+           --export-parallel-downloads 10 \
+           --yes                                     # Fast parallel export
+  %(prog)s --export-to-path /backup/maven \
+           --reposilite-url http://localhost:8080   # Export AND cache in Reposilite
+  %(prog)s --export-only \
+           --export-to-path /export/maven           # Export only, skip Reposilite entirely
+
+  # API Selection (works with both modes):
+  %(prog)s --use-assets-api-only                    # Use Assets API only
+  %(prog)s --use-components-api-only                # Use Components API only
   %(prog)s --nexus-url https://nexus.example.com \
            --nexus-repository core-releases \
-           --reposilite-url http://localhost:8080 \
-           --reposilite-repository releases \
-           --validate-after-sync                     # Full custom configuration with validation
+           --export-to-path /mnt/artifacts \
+           --export-parallel-downloads 15           # High-performance export
         '''
     )
     
@@ -86,6 +100,16 @@ Examples:
     parser.add_argument('--validate-only', action='store_true',
                         help='Skip sync and only validate existing assets in Reposilite against Nexus')
     
+    # Export feature arguments
+    parser.add_argument('--export-to-path', 
+                       help='Export artifacts directly to local filesystem instead of caching in Reposilite')
+    parser.add_argument('--preserve-structure', action='store_true', default=True,
+                       help='Maintain Maven directory structure in export (default: True)')
+    parser.add_argument('--export-parallel-downloads', type=int, default=5,
+                       help='Number of parallel downloads for export (default: 5)')
+    parser.add_argument('--export-only', action='store_true',
+                       help='Only export to filesystem, skip Reposilite caching entirely')
+    
     args = parser.parse_args()
     
     # Handle password from environment variable if not provided
@@ -94,6 +118,27 @@ Examples:
         if not args.nexus_password:
             import getpass
             args.nexus_password = getpass.getpass('Nexus password: ')
+    
+    # Validate export arguments
+    if args.export_to_path:
+        # Create export directory if it doesn't exist
+        export_path = Path(args.export_to_path)
+        try:
+            export_path.mkdir(parents=True, exist_ok=True)
+            if not export_path.is_dir():
+                parser.error(f"Export path '{args.export_to_path}' is not a directory")
+        except PermissionError:
+            parser.error(f"Permission denied creating export directory '{args.export_to_path}'")
+        except Exception as e:
+            parser.error(f"Invalid export path '{args.export_to_path}': {e}")
+    
+    # Validate export-only mode
+    if args.export_only and not args.export_to_path:
+        parser.error("--export-only requires --export-to-path to be specified")
+    
+    # Validate parallel downloads
+    if args.export_parallel_downloads < 1 or args.export_parallel_downloads > 20:
+        parser.error("--export-parallel-downloads must be between 1 and 20")
     
     return args
 
@@ -389,6 +434,164 @@ class NexusToReposiliteSyncer:
         self.log(f"Total asset paths found via Components API: {len(asset_paths)}")
         return asset_paths
     
+    def get_all_download_info_from_assets_api(self):
+        """Get all asset download info from Nexus using the Search Assets API - enhanced for export feature."""
+        self.log(f"Fetching all asset download info from Nexus repository: {self.args.nexus_repository}")
+        self.log(f"Nexus URL: {self.args.nexus_url}")
+        self.log(f"Authentication: {self.args.nexus_username}:{'*' * len(self.args.nexus_password) if self.args.nexus_password else 'None'}")
+
+        download_info = []
+        continuation_token = None
+        page = 1
+
+        while True:
+            params = {
+                'repository': self.args.nexus_repository
+            }
+            if continuation_token:
+                params['continuationToken'] = continuation_token
+
+            url = f"{self.args.nexus_url}/service/rest/v1/search/assets"
+
+            try:
+                self.log(f"Fetching page {page} of assets...")
+                self.debug_log(f"Asset fetch URL: {url}")
+                self.debug_log(f"Asset fetch params: {params}")
+
+                response = self.nexus_session.get(url, params=params, timeout=self.args.timeout)
+
+                self.debug_log(f"Asset fetch response status: {response.status_code}")
+                
+                if response.status_code != 200:
+                    self.log(f"ERROR: HTTP {response.status_code} - {response.reason}", force=True)
+                    self.log(f"Response content: {response.text[:500]}...", force=True)
+                    break
+
+                data = response.json()
+                page_items = data.get('items', [])
+                
+                for asset in page_items:
+                    if asset.get('path') and asset.get('downloadUrl'):
+                        info = {
+                            'path': asset['path'],
+                            'downloadUrl': asset['downloadUrl'],
+                            'contentType': asset.get('contentType', ''),
+                            'size': asset.get('contentLength', 0),
+                            'checksum': asset.get('checksum', {}),
+                            'format': asset.get('format', ''),
+                            'repository': asset.get('repository', self.args.nexus_repository)
+                        }
+                        download_info.append(info)
+
+                self.log(f"Page {page}: Found {len(page_items)} assets (Total: {len(download_info)})")
+
+                continuation_token = data.get('continuationToken')
+                if not continuation_token:
+                    break
+                
+                page += 1
+                time.sleep(0.2)
+
+            except requests.exceptions.ConnectionError as e:
+                self.log("ERROR: Connection lost to Nexus server during asset fetch.", force=True)
+                self.log(f"Technical details: {e}", force=True)
+                break
+            except requests.exceptions.Timeout:
+                self.log("ERROR: Request to Nexus for assets timed out.", force=True)
+                break
+            except requests.RequestException as e:
+                self.log(f"ERROR: Failed to fetch assets from Nexus: {e}", force=True)
+                break
+            except json.JSONDecodeError:
+                self.log(f"ERROR: Invalid JSON response from Nexus asset API.", force=True)
+                self.log(f"Response content: {response.text[:500]}...", force=True)
+                break
+
+        self.log(f"Total asset download info found in Nexus: {len(download_info)}")
+        return download_info
+    
+    def get_all_download_info_from_components_api(self):
+        """Get all asset download info from Nexus using the Components API - enhanced for export feature."""
+        self.log(f"Fetching all asset download info from Nexus Components API for repository: {self.args.nexus_repository}")
+
+        download_info = []
+        continuation_token = None
+        page = 1
+
+        while True:
+            params = {
+                'repository': self.args.nexus_repository
+            }
+            if continuation_token:
+                params['continuationToken'] = continuation_token
+
+            url = f"{self.args.nexus_url}/service/rest/v1/components"
+
+            try:
+                self.log(f"Fetching page {page} of components...")
+                self.debug_log(f"Components fetch URL: {url}")
+                self.debug_log(f"Components fetch params: {params}")
+
+                response = self.nexus_session.get(url, params=params, timeout=self.args.timeout)
+
+                self.debug_log(f"Components fetch response status: {response.status_code}")
+                
+                if response.status_code != 200:
+                    self.log(f"ERROR: HTTP {response.status_code} - {response.reason}", force=True)
+                    self.log(f"Response content: {response.text[:500]}...", force=True)
+                    break
+
+                data = response.json()
+                page_items = data.get('items', [])
+                
+                for component in page_items:
+                    # Each component has multiple assets
+                    for asset in component.get('assets', []):
+                        if asset.get('path') and asset.get('downloadUrl'):
+                            info = {
+                                'path': asset['path'],
+                                'downloadUrl': asset['downloadUrl'],
+                                'contentType': asset.get('contentType', ''),
+                                'size': asset.get('contentLength', 0),
+                                'checksum': asset.get('checksum', {}),
+                                'format': asset.get('format', ''),
+                                'repository': asset.get('repository', self.args.nexus_repository),
+                                # Add component info for better tracking
+                                'component': {
+                                    'group': component.get('group', ''),
+                                    'name': component.get('name', ''),
+                                    'version': component.get('version', '')
+                                }
+                            }
+                            download_info.append(info)
+
+                self.log(f"Page {page}: Found {len(page_items)} components with {len([a for c in page_items for a in c.get('assets', [])])} assets (Total download info: {len(download_info)})")
+
+                continuation_token = data.get('continuationToken')
+                if not continuation_token:
+                    break
+                
+                page += 1
+                time.sleep(0.2)
+
+            except requests.exceptions.ConnectionError as e:
+                self.log("ERROR: Connection lost to Nexus server during components fetch.", force=True)
+                self.log(f"Technical details: {e}", force=True)
+                break
+            except requests.exceptions.Timeout:
+                self.log("ERROR: Request to Nexus for components timed out.", force=True)
+                break
+            except requests.RequestException as e:
+                self.log(f"ERROR: Failed to fetch components from Nexus: {e}", force=True)
+                break
+            except json.JSONDecodeError:
+                self.log(f"ERROR: Invalid JSON response from Nexus components API.", force=True)
+                self.log(f"Response content: {response.text[:500]}...", force=True)
+                break
+
+        self.log(f"Total asset download info found via Components API: {len(download_info)}")
+        return download_info
+    
     def get_all_gavs_from_nexus(self):
         """Fetch every asset via the Assets Search API and collect unique GAVs (groupId, artifactId, version)."""
         self.log(f"Fetching all unique GAVs from Nexus repository: {self.args.nexus_repository}")
@@ -507,6 +710,151 @@ class NexusToReposiliteSyncer:
             return False, "Timeout"
         except requests.RequestException as e:
             return False, f"Request error: {str(e)}"
+    
+    def download_single_asset(self, asset_info, export_base_path):
+        """Download a single asset to the filesystem using its downloadUrl"""
+        path = asset_info['path']
+        download_url = asset_info['downloadUrl']
+        
+        try:
+            # Determine target file path
+            if self.args.preserve_structure:
+                target_file_path = Path(export_base_path) / path
+            else:
+                # Flat structure - just use filename
+                filename = os.path.basename(path)
+                target_file_path = Path(export_base_path) / filename
+            
+            # Create directory structure if needed
+            target_file_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Skip if file already exists and has same size
+            if target_file_path.exists():
+                existing_size = target_file_path.stat().st_size
+                expected_size = asset_info.get('size', 0)
+                if existing_size == expected_size and expected_size > 0:
+                    self.debug_log(f"Skipping {path} - already exists with correct size")
+                    return True, "Already exists", target_file_path
+            
+            # Download the file
+            self.debug_log(f"Downloading {download_url} to {target_file_path}")
+            response = self.nexus_session.get(download_url, stream=True, timeout=self.args.timeout)
+            
+            if response.status_code == 200:
+                with open(target_file_path, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                
+                # Verify file size if available
+                expected_size = asset_info.get('size', 0)
+                actual_size = target_file_path.stat().st_size
+                if expected_size > 0 and actual_size != expected_size:
+                    return False, f"Size mismatch: expected {expected_size}, got {actual_size}", target_file_path
+                
+                return True, "Downloaded", target_file_path
+            else:
+                return False, f"HTTP {response.status_code}: {response.reason}", target_file_path
+                
+        except Exception as e:
+            return False, f"Download error: {str(e)}", None
+    
+    def export_artifacts_to_filesystem(self, download_info):
+        """Export all artifacts to filesystem using parallel downloads"""
+        export_path = self.args.export_to_path
+        self.log(f"Starting export to: {export_path}", force=True)
+        self.log(f"Export mode: {'Preserve directory structure' if self.args.preserve_structure else 'Flat structure'}", force=True)
+        self.log(f"Parallel downloads: {self.args.export_parallel_downloads}", force=True)
+        self.log(f"Total assets to export: {len(download_info)}", force=True)
+        
+        # Export statistics
+        export_stats = {
+            'total': len(download_info),
+            'success': 0,
+            'failed': 0,
+            'already_exists': 0,
+            'total_bytes': 0,
+            'failed_items': []
+        }
+        
+        # Create a wrapper function for the thread pool
+        def download_worker(asset_info):
+            return self.download_single_asset(asset_info, export_path), asset_info
+        
+        self.log("\n" + "=" * 80, force=True)
+        self.log("STARTING FILESYSTEM EXPORT", force=True)
+        self.log("=" * 80, force=True)
+        
+        # Process downloads in parallel
+        with ThreadPoolExecutor(max_workers=self.args.export_parallel_downloads) as executor:
+            # Submit all download tasks
+            future_to_asset = {executor.submit(download_worker, asset_info): asset_info for asset_info in download_info}
+            
+            for i, future in enumerate(as_completed(future_to_asset), 1):
+                asset_info = future_to_asset[future]
+                path = asset_info['path']
+                
+                try:
+                    (success, message, target_path), _ = future.result()
+                    
+                    if success:
+                        if message == "Already exists":
+                            export_stats['already_exists'] += 1
+                            self.debug_log(f"✓ SKIPPED: {path} (already exists)")
+                        else:
+                            export_stats['success'] += 1
+                            export_stats['total_bytes'] += asset_info.get('size', 0)
+                            self.log(f"✓ EXPORTED: {path}")
+                    else:
+                        export_stats['failed'] += 1
+                        export_stats['failed_items'].append((path, message))
+                        self.log(f"✗ FAILED: {path} ({message})")
+                        
+                except Exception as e:
+                    export_stats['failed'] += 1
+                    export_stats['failed_items'].append((path, f"Exception: {str(e)}"))
+                    self.log(f"✗ ERROR: {path} ({str(e)})")
+                
+                # Progress update
+                if i % 50 == 0:
+                    elapsed = datetime.now() - self.start_time
+                    rate = i / elapsed.total_seconds() if elapsed.total_seconds() > 0 else 0
+                    self.log(f"  Progress: {i}/{export_stats['total']} ({i/export_stats['total']*100:.1f}%) - {rate:.2f} files/sec")
+        
+        # Print export summary
+        self.print_export_summary(export_stats)
+        return export_stats
+    
+    def print_export_summary(self, export_stats):
+        """Print export operation summary"""
+        elapsed = datetime.now() - self.start_time
+        rate = export_stats['total'] / elapsed.total_seconds() if elapsed.total_seconds() > 0 else 0
+        total_mb = export_stats['total_bytes'] / (1024 * 1024)
+        
+        self.log("\n" + "=" * 80, force=True)
+        self.log("FILESYSTEM EXPORT COMPLETED", force=True) 
+        self.log("=" * 80, force=True)
+        self.log(f"Export location: {self.args.export_to_path}", force=True)
+        self.log(f"Total files processed: {export_stats['total']}", force=True)
+        self.log(f"Successfully exported: {export_stats['success']}", force=True)
+        self.log(f"Already existed: {export_stats['already_exists']}", force=True)
+        self.log(f"Failed: {export_stats['failed']}", force=True)
+        self.log(f"Total data exported: {total_mb:.2f} MB", force=True)
+        
+        if export_stats['failed_items']:
+            self.log("--- FAILED EXPORTS ---", force=True)
+            for i, (path, reason) in enumerate(export_stats['failed_items']):
+                if i < 20:  # Show first 20 failures
+                    self.log(f"  - {path} (Reason: {reason})", force=True)
+            if len(export_stats['failed_items']) > 20:
+                self.log(f"  ... and {len(export_stats['failed_items']) - 20} more. See log file for full list.", force=True)
+            self.log("------------------------", force=True)
+
+        success_rate = (export_stats['success'] + export_stats['already_exists']) / export_stats['total'] * 100 if export_stats['total'] > 0 else 0
+        self.log(f"Success rate: {success_rate:.1f}%", force=True)
+        self.log(f"Total time: {str(elapsed).split('.')[0]}", force=True)
+        self.log(f"Average rate: {rate:.2f} files/second", force=True)
+        self.log(f"Log file: {self.log_file}", force=True)
+        self.log("=" * 80, force=True)
     
     def validate_sync_completeness(self, asset_paths):
         """Validate that all assets from Nexus are available in Reposilite"""
@@ -673,6 +1021,138 @@ class NexusToReposiliteSyncer:
         
         # Final summary
         self.print_summary()
+        return True
+    
+    def sync_all_artifacts_enhanced(self):
+        """Enhanced synchronization process that supports both Reposilite caching and filesystem export"""
+        self.log("=" * 80, force=True)
+        if self.args.export_to_path:
+            if self.args.export_only:
+                self.log("NEXUS FILESYSTEM EXPORT STARTED", force=True)
+            else:
+                self.log("NEXUS TO REPOSILITE SYNC + FILESYSTEM EXPORT STARTED", force=True)
+        else:
+            self.log("NEXUS TO REPOSILITE FULL EXPORT STARTED", force=True)
+        self.log("=" * 80, force=True)
+        self.log(f"Source: {self.args.nexus_url}/repository/{self.args.nexus_repository}", force=True)
+        
+        if not self.args.export_only:
+            self.log(f"Reposilite Target: {self.args.reposilite_url}/{self.args.reposilite_repository}", force=True)
+        if self.args.export_to_path:
+            self.log(f"Export Target: {self.args.export_to_path}", force=True)
+            
+        self.log(f"Log file: {self.log_file}", force=True)
+        
+        # Step 0: Test connectivity first
+        if not self.test_nexus_connectivity():
+            self.log("ERROR: Cannot establish connection to Nexus - aborting", force=True)
+            return False
+        
+        # Step 1: Get download info from Nexus APIs
+        download_info = None
+        
+        if self.args.use_assets_api_only:
+            self.log("Using Assets API only for enhanced data collection...")
+            download_info = self.get_all_download_info_from_assets_api()
+            self.log(f"Assets API found: {len(download_info)} assets with download info")
+        elif self.args.use_components_api_only:
+            self.log("Using Components API only for enhanced data collection...")
+            download_info = self.get_all_download_info_from_components_api()
+            self.log(f"Components API found: {len(download_info)} assets with download info")
+        else:
+            # Default: Use both APIs for maximum completeness
+            self.log("Fetching assets using multiple API methods for enhanced data collection...")
+            
+            # Method 1: Assets API
+            download_info_from_assets = self.get_all_download_info_from_assets_api()
+            self.log(f"Assets API found: {len(download_info_from_assets)} assets with download info")
+            
+            # Method 2: Components API
+            download_info_from_components = self.get_all_download_info_from_components_api()
+            self.log(f"Components API found: {len(download_info_from_components)} assets with download info")
+            
+            # Combine and deduplicate based on path
+            all_info = download_info_from_assets + download_info_from_components
+            seen_paths = set()
+            download_info = []
+            for info in all_info:
+                path = info['path']
+                if path not in seen_paths:
+                    download_info.append(info)
+                    seen_paths.add(path)
+                    
+            self.log(f"Combined unique assets: {len(download_info)}")
+            
+            # Report on differences
+            assets_paths = {info['path'] for info in download_info_from_assets}
+            components_paths = {info['path'] for info in download_info_from_components}
+            
+            assets_only = assets_paths - components_paths
+            components_only = components_paths - assets_paths
+            
+            if assets_only:
+                self.log(f"Assets API found {len(assets_only)} additional paths not in Components API")
+                self.debug_log(f"Sample assets-only paths: {list(assets_only)[:5]}")
+            
+            if components_only:
+                self.log(f"Components API found {len(components_only)} additional paths not in Assets API")
+                self.debug_log(f"Sample components-only paths: {list(components_only)[:5]}")
+        
+        if not download_info:
+            self.log("ERROR: No assets found or failed to fetch from Nexus", force=True)
+            self.log("TROUBLESHOOTING:", force=True)
+            self.log("1. Check if the repository name is correct with --list-repositories", force=True)
+            self.log("2. Verify read permissions for the user on the repository.", force=True)
+            self.log("3. The repository might actually be empty.", force=True)
+            return False
+        
+        # Step 2: Process filesystem export if requested
+        export_stats = None
+        if self.args.export_to_path:
+            export_stats = self.export_artifacts_to_filesystem(download_info)
+        
+        # Step 3: Process Reposilite caching (unless export-only mode)
+        if not self.args.export_only:
+            # Convert download_info back to asset_paths for existing logic
+            asset_paths = [info['path'] for info in download_info]
+            
+            if not self.args.validate_only:
+                self._process_asset_paths(asset_paths)
+            else:
+                self.log("Skipping Reposilite sync - validation-only mode requested", force=True)
+        
+        # Step 4: Validate sync completeness if requested
+        if (self.args.validate_after_sync or self.args.validate_only) and not self.args.export_only:
+            self.log("\n" + "=" * 80, force=True)
+            self.log("STARTING REPOSILITE VALIDATION", force=True)
+            self.log("=" * 80, force=True)
+            
+            asset_paths = [info['path'] for info in download_info]
+            is_complete, missing_files, validation_errors = self.validate_sync_completeness(asset_paths)
+            
+            if is_complete:
+                self.log("✓ VALIDATION PASSED: All assets are available in Reposilite!", force=True)
+            else:
+                self.log(f"✗ VALIDATION FAILED: {len(missing_files)} assets are missing in Reposilite", force=True)
+                
+                # Save missing files to log for later analysis
+                with open(self.log_file + ".missing", 'w', encoding='utf-8') as f:
+                    f.write("# Missing files found during validation\n")
+                    f.write(f"# Total missing: {len(missing_files)}\n")
+                    f.write("# One file path per line\n\n")
+                    for missing_file in missing_files:
+                        f.write(f"{missing_file}\n")
+                
+                self.log(f"Missing files list saved to: {self.log_file}.missing", force=True)
+        
+        # Final summary
+        if export_stats:
+            # Export summary was already printed, just print Reposilite summary if applicable
+            if not self.args.export_only:
+                self.print_summary()
+        else:
+            self.print_summary()
+        
         return True
     
     def get_all_asset_paths_for_gavs(self, gavs):
@@ -925,14 +1405,26 @@ def main():
             print(f"Nexus authentication: {args.nexus_username}")
         print("\n🔍 VALIDATION MODE: Will check completeness without syncing")
         print()
-    
-    print("Nexus to Reposilite Full Export Tool")
-    print("=" * 50)
+    elif args.export_to_path:
+        if args.export_only:
+            print("Nexus Filesystem Export Tool")
+        else:
+            print("Nexus to Reposilite + Filesystem Export Tool")
+        print("=" * 50)
+    else:
+        print("Nexus to Reposilite Full Export Tool")
+        print("=" * 50)
     
     # Display configuration
     print(f"Source: {args.nexus_url}/repository/{args.nexus_repository}")
-    print(f"Target: {args.reposilite_url}/{args.reposilite_repository}")
-    print(f"Rate limit: {args.rate_limit} requests/second")
+    if not args.export_only:
+        print(f"Reposilite Target: {args.reposilite_url}/{args.reposilite_repository}")
+    if args.export_to_path:
+        print(f"Export Target: {args.export_to_path}")
+        print(f"Directory Structure: {'Preserved' if args.preserve_structure else 'Flat'}")
+        print(f"Parallel Downloads: {args.export_parallel_downloads}")
+    if not args.export_only:
+        print(f"Rate limit: {args.rate_limit} requests/second")
     print(f"Timeout: {args.timeout} seconds")
     if args.nexus_username:
         print(f"Nexus authentication: {args.nexus_username}")
@@ -940,6 +1432,10 @@ def main():
     
     # Show helpful hints
     print("💡 TIP: Use --list-repositories to see available repositories first")
+    if args.export_to_path:
+        print("📁 EXPORT: Files will be downloaded directly from Nexus using downloadUrls")
+        if args.export_only:
+            print("⚡ EXPORT-ONLY: Skipping Reposilite caching entirely")
     if args.debug:
         print("🔍 DEBUG MODE: Verbose logging is active.")
     print()
@@ -958,16 +1454,22 @@ def main():
     try:
         if args.sync_by_gav:
             success = syncer.sync_by_gav()
+        elif args.export_to_path:
+            # Use enhanced method for export functionality
+            success = syncer.sync_all_artifacts_enhanced()
         else:
+            # Use original method for backward compatibility
             success = syncer.sync_all_artifacts()
         sys.exit(0 if success else 1)
     except KeyboardInterrupt:
-        syncer.log("\nERROR: Export interrupted by user", force=True)
-        syncer.print_summary()
+        syncer.log("\nERROR: Operation interrupted by user", force=True)
+        if hasattr(syncer, 'print_summary'):
+            syncer.print_summary()
         sys.exit(1)
     except Exception as e:
         syncer.log(f"ERROR: Unexpected error: {e}", force=True)
-        syncer.print_summary()
+        if hasattr(syncer, 'print_summary'):
+            syncer.print_summary()
         sys.exit(1)
 
 if __name__ == "__main__":
